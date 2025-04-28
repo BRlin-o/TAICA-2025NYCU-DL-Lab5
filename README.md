@@ -4,7 +4,9 @@
 
 ### Normal
 
-python dqn-2.py --wandb-run-name pong-mps-3-1 --save-dir ./runs/result-pong-mps-3-1 --episodes 20000
+```bash
+python dqn-2.py --wandb-run-name pong-mps-3-1 --save-dir ./runs/result-pong-mps-3-1 --episodes 20000 --memory-size 200000
+```
 
 ### Continue Training
 

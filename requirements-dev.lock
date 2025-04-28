@@ -23,6 +23,8 @@ click==8.1.8
     # via wandb
 cloudpickle==3.1.1
     # via gymnasium
+colorama==0.4.6
+    # via click
 docker-pycreds==0.4.0
     # via wandb
 farama-notifications==0.0.4

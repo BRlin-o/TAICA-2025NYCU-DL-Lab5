@@ -20,13 +20,6 @@ import contextlib
 
 gym.register_envs(ale_py)
 
-wandb.init(
-    project="DLP-Lab5-DQN-CartPole",
-    id="a6y8n2gn",     # ← 這就是 run-id
-    resume="must",     # 必須找到同一條 run，否則報錯
-)
-
-
 def init_weights(m):
     if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
         nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
@@ -136,7 +129,7 @@ class DQNAgent:
 
         if torch.backends.mps.is_available():
             self.device = torch.device("mps")
-        elif torch.backends.cuda.is_available():
+        elif torch.cuda.is_available():
             self.device = torch.device("cuda")
         else:
             self.device = torch.device("cpu")
@@ -382,9 +375,17 @@ if __name__ == "__main__":
     parser.add_argument("--load-ckpt", type=str, default="", help="Path to checkpoint")
     parser.add_argument("--ep-count", type=int, default=0, help="Episode count for loading checkpoint")
     parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run")
+    parser.add_argument("--wandb-id",  type=str, default=None, help="run_id to resume")
     args = parser.parse_args()
 
-    wandb.init(project="DLP-Lab5-DQN-CartPole", name=args.wandb_run_name, save_code=True)
+    wandb.init(
+        project=f"DLP-Lab5-DQN-Pong",
+        name=args.wandb_run_name,
+        id=args.wandb_id,  # ← 這就是 run-id
+        resume="must" if args.wandb_id is not None else None,     # 必須找到同一條 run，否則報錯
+        save_code=True,
+    )
+
     agent = DQNAgent(args=args)
     if args.load_ckpt:
         agent.load_checkpoint(args.load_ckpt)
