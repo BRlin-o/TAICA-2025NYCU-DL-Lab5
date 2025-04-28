@@ -12,6 +12,7 @@ wheels/
 # Project
 src/*/results
 src/*/wandb
+src/*/runs
 
 # Mac default
 .DS_Store

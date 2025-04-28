@@ -20,6 +20,12 @@ import contextlib
 
 gym.register_envs(ale_py)
 
+wandb.init(
+    project="DLP-Lab5-DQN-CartPole",
+    id="a6y8n2gn",     # ← 這就是 run-id
+    resume="must",     # 必須找到同一條 run，否則報錯
+)
+
 
 def init_weights(m):
     if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
@@ -155,6 +161,7 @@ class DQNAgent:
         self.epsilon_decay = args.epsilon_decay
         self.epsilon_min = args.epsilon_min
 
+        self.ep_count = args.ep_count if args else 0
         self.env_count = 0
         self.train_count = 0
         self.best_reward = -21  # Initialized for Pong
@@ -174,7 +181,8 @@ class DQNAgent:
         return q_values.argmax().item()
 
     def run(self, episodes=1000):
-        for ep in range(episodes):
+        for _ in range(episodes):
+            ep = self.ep_count 
             obs, _ = self.env.reset()
 
             state = self.preprocessor.reset(obs)
@@ -206,7 +214,7 @@ class DQNAgent:
                         "Env Step Count": self.env_count,
                         "Update Count": self.train_count,
                         "Epsilon": self.epsilon
-                    })
+                    }, step=self.env_count)
                     ########## YOUR CODE HERE  ##########
                     # Add additional wandb logs for debugging if needed 
                     
@@ -218,22 +226,22 @@ class DQNAgent:
                 "Env Step Count": self.env_count,
                 "Update Count": self.train_count,
                 "Epsilon": self.epsilon
-            })
+            }, step=self.env_count)
             ########## YOUR CODE HERE  ##########
             # Add additional wandb logs for debugging if needed 
             
             ########## END OF YOUR CODE ##########  
             if ep % 100 == 0:
                 model_path = os.path.join(self.save_dir, f"model_ep{ep}.pt")
-                torch.save(self.q_net.state_dict(), model_path)
-                print(f"Saved model checkpoint to {model_path}")
+                self.save_checkpoint(model_path)
+                print(f"[Checkpoint] Saved to ckpt_ep{ep}.pt")
 
             if ep % 20 == 0:
                 eval_reward = self.evaluate()
                 if eval_reward > self.best_reward:
                     self.best_reward = eval_reward
                     model_path = os.path.join(self.save_dir, "best_model.pt")
-                    torch.save(self.q_net.state_dict(), model_path)
+                    self.save_checkpoint(model_path)
                     print(f"Saved new best model to {model_path} with reward {eval_reward}")
                 print(f"[TrueEval] Ep: {ep} Eval Reward: {eval_reward:.2f} SC: {self.env_count} UC: {self.train_count}")
                 wandb.log({
@@ -241,6 +249,55 @@ class DQNAgent:
                     "Update Count": self.train_count,
                     "Eval Reward": eval_reward
                 })
+            self.ep_count += 1
+
+    def save_checkpoint(self, path):
+        ckpt = {
+            "q_net": self.q_net.state_dict(),
+            "target_net": self.target_net.state_dict(),
+            "optim": self.optimizer.state_dict(),
+            "epsilon": self.epsilon,
+            "env_count": self.env_count,
+            "train_count": self.train_count,
+            "ep_count": self.ep_count
+        }
+        torch.save(ckpt, path)
+
+    def load_checkpoint(self, path):
+        if not path or not os.path.isfile(path):
+            print(f"[Checkpoint] {path} not found，跳過載入")
+            return
+        ckpt = torch.load(path, map_location=self.device)
+
+        # ── 1. 先載入 q_net ──
+        if isinstance(ckpt, dict) and "q_net" in ckpt:     # 完整 ckpt
+            self.q_net.load_state_dict(ckpt["q_net"])
+        else:                                              # 只有 q_net weights
+            self.q_net.load_state_dict(ckpt)
+
+        # ── 2. target_net：若沒存就複製 q_net 的權重 ──
+        target_sd = ckpt.get("target_net") if isinstance(ckpt, dict) else None
+        if target_sd is None:
+            target_sd = self.q_net.state_dict()
+        self.target_net.load_state_dict(target_sd)
+
+        # ── 3. 其餘資訊 ──
+        if isinstance(ckpt, dict) and "optim" in ckpt:
+            self.optimizer.load_state_dict(ckpt["optim"])
+            self.optimizer_to_device()          # 如果用了 MPS/CUDA，確保 tensor 在對的 device
+        self.ep_count    = ckpt.get("ep_count",    self.ep_count)
+        self.epsilon     = ckpt.get("epsilon",     self.epsilon)     if isinstance(ckpt, dict) else self.epsilon
+        self.env_count   = ckpt.get("env_count",   self.env_count)   if isinstance(ckpt, dict) else self.env_count
+        self.train_count = ckpt.get("train_count", self.train_count) if isinstance(ckpt, dict) else self.train_count
+
+        print(f"[Checkpoint] Loaded {path}  ε={self.epsilon:.3f}  env={self.env_count}  upd={self.train_count}")
+
+    def optimizer_to_device(self):
+        # 將 optimizer 內的 state tensor 搬到 self.device，避免 MPS/CUDA 報錯
+        for state in self.optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(self.device)
 
     def evaluate(self):
         obs, _ = self.test_env.reset()
@@ -322,8 +379,12 @@ if __name__ == "__main__":
     parser.add_argument("--replay-start-size", type=int, default=50000)
     parser.add_argument("--max-episode-steps", type=int, default=10000)
     parser.add_argument("--train-per-step", type=int, default=1)
+    parser.add_argument("--load-ckpt", type=str, default="", help="Path to checkpoint")
+    parser.add_argument("--ep-count", type=int, default=0, help="Episode count for loading checkpoint")
     args = parser.parse_args()
 
     wandb.init(project="DLP-Lab5-DQN-CartPole", name=args.wandb_run_name, save_code=True)
     agent = DQNAgent(args=args)
-    agent.run()
+    if args.load_ckpt:
+        agent.load_checkpoint(args.load_ckpt)
+    agent.run(episodes=4000)
