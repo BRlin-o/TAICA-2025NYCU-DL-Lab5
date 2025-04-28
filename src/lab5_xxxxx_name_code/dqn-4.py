@@ -16,15 +16,8 @@ from collections import deque
 import wandb
 import argparse
 import time
-import contextlib
 
 gym.register_envs(ale_py)
-
-wandb.init(
-    project="DLP-Lab5-DQN-CartPole",
-    id="a6y8n2gn",     # ← 這就是 run-id
-    resume="must",     # 必須找到同一條 run，否則報錯
-)
 
 
 def init_weights(m):
@@ -40,7 +33,7 @@ class DQN(nn.Module):
         - Feel free to change the architecture (e.g. number of hidden layers and the width of each hidden layer) as you like
         - Feel free to add any member variables/functions whenever needed
     """
-    def __init__(self, num_actions, input_shape):
+    def __init__(self, num_actions):
         super(DQN, self).__init__()
         # An example: 
         #self.network = nn.Sequential(
@@ -51,21 +44,7 @@ class DQN(nn.Module):
         #    nn.Linear(64, num_actions)
         #)       
         ########## YOUR CODE HERE (5~10 lines) ##########
-        if len(input_shape) == 1:            # CartPole → 向量
-            self.network = nn.Sequential(
-                nn.Linear(input_shape[0], 128), nn.ReLU(),
-                nn.Linear(128, 128), nn.ReLU(),
-                nn.Linear(128, num_actions)
-            )
-        else:                                # Pong → 影像 (4,84,84)
-            self.network = nn.Sequential(
-                nn.Conv2d(input_shape[0], 32, 8, 4), nn.ReLU(),
-                nn.Conv2d(32, 64, 4, 2),     nn.ReLU(),
-                nn.Conv2d(64, 64, 3, 1),     nn.ReLU(),
-                nn.Flatten(),
-                nn.Linear(64*7*7, 512),      nn.ReLU(),
-                nn.Linear(512, num_actions)
-            )
+
         
         ########## END OF YOUR CODE ##########
 
@@ -128,30 +107,19 @@ class PrioritizedReplayBuffer:
         
 
 class DQNAgent:
-    def __init__(self, env_name="ALE/Pong-v5", args=None):
+    def __init__(self, env_name="CartPole-v1", args=None):
         self.env = gym.make(env_name, render_mode="rgb_array")
         self.test_env = gym.make(env_name, render_mode="rgb_array")
         self.num_actions = self.env.action_space.n
         self.preprocessor = AtariPreprocessor()
 
-        if torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-        elif torch.backends.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("Using device:", self.device)
 
-        # Uniform replay buffer for Task 2 (Vanilla DQN on Pong)
-        self.memory = deque(maxlen=args.memory_size)
 
-        # Build networks with correct input shape after preprocessing one observation
-        dummy_obs, _ = self.env.reset()
-        dummy_state = self.preprocessor.reset(dummy_obs)
-        input_shape = dummy_state.shape  # (4, 84, 84)
-        self.q_net = DQN(self.num_actions, input_shape).to(self.device)
+        self.q_net = DQN(self.num_actions).to(self.device)
         self.q_net.apply(init_weights)
-        self.target_net = DQN(self.num_actions, input_shape).to(self.device)
+        self.target_net = DQN(self.num_actions).to(self.device)
         self.target_net.load_state_dict(self.q_net.state_dict())
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=args.lr)
 
@@ -161,10 +129,9 @@ class DQNAgent:
         self.epsilon_decay = args.epsilon_decay
         self.epsilon_min = args.epsilon_min
 
-        self.ep_count = args.ep_count if args else 0
         self.env_count = 0
         self.train_count = 0
-        self.best_reward = -21  # Initialized for Pong
+        self.best_reward = 0  # Initilized to 0 for CartPole and to -21 for Pong
         self.max_episode_steps = args.max_episode_steps
         self.replay_start_size = args.replay_start_size
         self.target_update_frequency = args.target_update_frequency
@@ -175,14 +142,13 @@ class DQNAgent:
     def select_action(self, state):
         if random.random() < self.epsilon:
             return random.randint(0, self.num_actions - 1)
-        state_tensor = torch.from_numpy(np.array(state) / 255.0).float().unsqueeze(0).to(self.device)
+        state_tensor = torch.from_numpy(np.array(state)).float().unsqueeze(0).to(self.device)
         with torch.no_grad():
             q_values = self.q_net(state_tensor)
         return q_values.argmax().item()
 
     def run(self, episodes=1000):
-        for _ in range(episodes):
-            ep = self.ep_count 
+        for ep in range(episodes):
             obs, _ = self.env.reset()
 
             state = self.preprocessor.reset(obs)
@@ -214,7 +180,7 @@ class DQNAgent:
                         "Env Step Count": self.env_count,
                         "Update Count": self.train_count,
                         "Epsilon": self.epsilon
-                    }, step=self.env_count)
+                    })
                     ########## YOUR CODE HERE  ##########
                     # Add additional wandb logs for debugging if needed 
                     
@@ -226,22 +192,22 @@ class DQNAgent:
                 "Env Step Count": self.env_count,
                 "Update Count": self.train_count,
                 "Epsilon": self.epsilon
-            }, step=self.env_count)
+            })
             ########## YOUR CODE HERE  ##########
             # Add additional wandb logs for debugging if needed 
             
             ########## END OF YOUR CODE ##########  
             if ep % 100 == 0:
                 model_path = os.path.join(self.save_dir, f"model_ep{ep}.pt")
-                self.save_checkpoint(model_path)
-                print(f"[Checkpoint] Saved to ckpt_ep{ep}.pt")
+                torch.save(self.q_net.state_dict(), model_path)
+                print(f"Saved model checkpoint to {model_path}")
 
             if ep % 20 == 0:
                 eval_reward = self.evaluate()
                 if eval_reward > self.best_reward:
                     self.best_reward = eval_reward
                     model_path = os.path.join(self.save_dir, "best_model.pt")
-                    self.save_checkpoint(model_path)
+                    torch.save(self.q_net.state_dict(), model_path)
                     print(f"Saved new best model to {model_path} with reward {eval_reward}")
                 print(f"[TrueEval] Ep: {ep} Eval Reward: {eval_reward:.2f} SC: {self.env_count} UC: {self.train_count}")
                 wandb.log({
@@ -249,55 +215,6 @@ class DQNAgent:
                     "Update Count": self.train_count,
                     "Eval Reward": eval_reward
                 })
-            self.ep_count += 1
-
-    def save_checkpoint(self, path):
-        ckpt = {
-            "q_net": self.q_net.state_dict(),
-            "target_net": self.target_net.state_dict(),
-            "optim": self.optimizer.state_dict(),
-            "epsilon": self.epsilon,
-            "env_count": self.env_count,
-            "train_count": self.train_count,
-            "ep_count": self.ep_count
-        }
-        torch.save(ckpt, path)
-
-    def load_checkpoint(self, path):
-        if not path or not os.path.isfile(path):
-            print(f"[Checkpoint] {path} not found，跳過載入")
-            return
-        ckpt = torch.load(path, map_location=self.device)
-
-        # ── 1. 先載入 q_net ──
-        if isinstance(ckpt, dict) and "q_net" in ckpt:     # 完整 ckpt
-            self.q_net.load_state_dict(ckpt["q_net"])
-        else:                                              # 只有 q_net weights
-            self.q_net.load_state_dict(ckpt)
-
-        # ── 2. target_net：若沒存就複製 q_net 的權重 ──
-        target_sd = ckpt.get("target_net") if isinstance(ckpt, dict) else None
-        if target_sd is None:
-            target_sd = self.q_net.state_dict()
-        self.target_net.load_state_dict(target_sd)
-
-        # ── 3. 其餘資訊 ──
-        if isinstance(ckpt, dict) and "optim" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optim"])
-            self.optimizer_to_device()          # 如果用了 MPS/CUDA，確保 tensor 在對的 device
-        self.ep_count    = ckpt.get("ep_count",    self.ep_count)
-        self.epsilon     = ckpt.get("epsilon",     self.epsilon)     if isinstance(ckpt, dict) else self.epsilon
-        self.env_count   = ckpt.get("env_count",   self.env_count)   if isinstance(ckpt, dict) else self.env_count
-        self.train_count = ckpt.get("train_count", self.train_count) if isinstance(ckpt, dict) else self.train_count
-
-        print(f"[Checkpoint] Loaded {path}  ε={self.epsilon:.3f}  env={self.env_count}  upd={self.train_count}")
-
-    def optimizer_to_device(self):
-        # 將 optimizer 內的 state tensor 搬到 self.device，避免 MPS/CUDA 報錯
-        for state in self.optimizer.state.values():
-            for k, v in state.items():
-                if torch.is_tensor(v):
-                    state[k] = v.to(self.device)
 
     def evaluate(self):
         obs, _ = self.test_env.reset()
@@ -306,7 +223,7 @@ class DQNAgent:
         total_reward = 0
 
         while not done:
-            state_tensor = torch.from_numpy(np.array(state) / 255.0).float().unsqueeze(0).to(self.device)
+            state_tensor = torch.from_numpy(np.array(state)).float().unsqueeze(0).to(self.device)
             with torch.no_grad():
                 action = self.q_net(state_tensor).argmax().item()
             next_obs, reward, terminated, truncated, _ = self.test_env.step(action)
@@ -327,47 +244,41 @@ class DQNAgent:
             self.epsilon *= self.epsilon_decay
         self.train_count += 1
        
-        # Sample a mini‑batch of (s,a,r,s',done) from the replay buffer
-        batch = random.sample(self.memory, self.batch_size)
-        states, actions, rewards, next_states, dones = map(np.array, zip(*batch))
+        ########## YOUR CODE HERE (<5 lines) ##########
+        # Sample a mini-batch of (s,a,r,s',done) from the replay buffer
+
+      
+            
+        ########## END OF YOUR CODE ##########
 
         # Convert the states, actions, rewards, next_states, and dones into torch tensors
-        states = torch.from_numpy(states.astype(np.float32) / 255.0).to(self.device)
-        next_states = torch.from_numpy(next_states.astype(np.float32) / 255.0).to(self.device)
-        actions = torch.tensor(actions, dtype=torch.int64).to(self.device)
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
-        dones = torch.tensor(dones, dtype=torch.float32).to(self.device)
-
-        # Use mixed precision on Apple‑Silicon / CUDA
-        use_autocast = self.device.type in ['cuda', 'mps']
-        autocast_ctx = torch.autocast(device_type=self.device.type, dtype=torch.float16) if use_autocast else contextlib.nullcontext()
-        with autocast_ctx:
-            q_pred = self.q_net(states)
-            q_values = q_pred.gather(1, actions.unsqueeze(1)).squeeze(1)
-
-            with torch.no_grad():
-                next_q = self.target_net(next_states).max(1)[0]
-            targets = rewards + self.gamma * next_q * (1 - dones)
-
-            loss = nn.functional.mse_loss(q_values, targets)
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.q_net.parameters(), 1.0)
-        self.optimizer.step()
+        # NOTE: Enable this part after you finish the mini-batch sampling
+        #states = torch.from_numpy(np.array(states).astype(np.float32)).to(self.device)
+        #next_states = torch.from_numpy(np.array(next_states).astype(np.float32)).to(self.device)
+        #actions = torch.tensor(actions, dtype=torch.int64).to(self.device)
+        #rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
+        #dones = torch.tensor(dones, dtype=torch.float32).to(self.device)
+        #q_values = self.q_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        
+        ########## YOUR CODE HERE (~10 lines) ##########
+        # Implement the loss function of DQN and the gradient updates 
+      
+        
+      
+        ########## END OF YOUR CODE ##########  
 
         if self.train_count % self.target_update_frequency == 0:
             self.target_net.load_state_dict(self.q_net.state_dict())
 
         # NOTE: Enable this part if "loss" is defined
-        if self.train_count % 1000 == 0:
-            print(f"[Train #{self.train_count}] Loss: {loss.item():.4f} Q mean: {q_values.mean().item():.3f} std: {q_values.std().item():.3f}")
+        #if self.train_count % 1000 == 0:
+        #    print(f"[Train #{self.train_count}] Loss: {loss.item():.4f} Q mean: {q_values.mean().item():.3f} std: {q_values.std().item():.3f}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--save-dir", type=str, default="./results")
-    parser.add_argument("--wandb-run-name", type=str, default="pong-run")
+    parser.add_argument("--wandb-run-name", type=str, default="cartpole-run")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--memory-size", type=int, default=100000)
     parser.add_argument("--lr", type=float, default=0.0001)
@@ -379,13 +290,8 @@ if __name__ == "__main__":
     parser.add_argument("--replay-start-size", type=int, default=50000)
     parser.add_argument("--max-episode-steps", type=int, default=10000)
     parser.add_argument("--train-per-step", type=int, default=1)
-    parser.add_argument("--load-ckpt", type=str, default="", help="Path to checkpoint")
-    parser.add_argument("--ep-count", type=int, default=0, help="Episode count for loading checkpoint")
-    parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run")
     args = parser.parse_args()
 
     wandb.init(project="DLP-Lab5-DQN-CartPole", name=args.wandb_run_name, save_code=True)
     agent = DQNAgent(args=args)
-    if args.load_ckpt:
-        agent.load_checkpoint(args.load_ckpt)
-    agent.run(episodes=args.episodes)
+    agent.run()
