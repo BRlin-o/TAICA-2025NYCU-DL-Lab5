@@ -17,6 +17,56 @@ import wandb
 import argparse
 import time
 import contextlib
+from gymnasium.wrappers import AtariPreprocessing
+try:
+    from gymnasium.wrappers import FrameStack
+except ImportError:
+    pass
+
+# ---------------------------------------------------------------------------
+# Fallback: minimal FrameStack wrapper (channel‑first) for Gymnasium versions
+# that do NOT expose FrameStack in the public API (e.g. 1.1.x packaged by Rye)
+# ---------------------------------------------------------------------------
+if "FrameStack" not in globals():          # still missing
+    from collections import deque
+    import numpy as _np
+    import gymnasium as _gym
+
+    class FrameStack(_gym.Wrapper):
+        """
+        Simple channel‑first frame stack that mimics Gymnasium's FrameStack.
+        Stacks `num_stack` consecutive observations on axis‑0:
+            single frame shape (C, H, W) -> stacked shape (num_stack, C, H, W)
+        """
+        def __init__(self, env, num_stack=4):
+            super().__init__(env)
+            self.num_stack = num_stack
+            self.frames = deque(maxlen=num_stack)
+
+            obs_space = env.observation_space
+            assert len(obs_space.shape) >= 2, "FrameStack expects image observations"
+
+            low  = _np.repeat(obs_space.low[None, ...], num_stack, axis=0)
+            high = _np.repeat(obs_space.high[None, ...], num_stack, axis=0)
+            self.observation_space = _gym.spaces.Box(
+                low=low, high=high, dtype=obs_space.dtype
+            )
+
+        def reset(self, **kwargs):
+            obs, info = self.env.reset(**kwargs)
+            for _ in range(self.num_stack):
+                self.frames.append(obs)
+            return self._get_observation(), info
+
+        def step(self, action):
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            self.frames.append(obs)
+            return self._get_observation(), reward, terminated, truncated, info
+
+        def _get_observation(self):
+            return _np.stack(self.frames, axis=0)
+from gymnasium.vector import AsyncVectorEnv
+from functools import partial
 
 gym.register_envs(ale_py)
 
@@ -122,10 +172,34 @@ class PrioritizedReplayBuffer:
 
 class DQNAgent:
     def __init__(self, env_name="ALE/Pong-v5", args=None):
-        self.env = gym.make(env_name, render_mode="rgb_array")
-        self.test_env = gym.make(env_name, render_mode="rgb_array")
-        self.num_actions = self.env.action_space.n
-        self.preprocessor = AtariPreprocessor()
+        # ---- Vector-env 與 Preprocessing ----
+        NUM_ENVS = 4                                             # ← 需要幾個並行環境自己改
+        def make_env(name):
+            """回傳一個已經做完灰階、84x84、stack 4 frame 的單環境"""
+            env = gym.make(name, render_mode="rgb_array",
+                        obs_type="rgb",        # 先給 RGB，等等讓 wrapper 灰階
+                        frameskip=1,           # 讓 AtariPreprocessing 來負責 skip
+                        full_action_space=False)
+            env = AtariPreprocessing(env,
+                                    frame_skip=4,   # 同論文
+                                    grayscale_obs=True,
+                                    scale_obs=False,
+                                    terminal_on_life_loss=False,
+                                    screen_size=84)
+            env = FrameStack(env, num_stack=4)      # 4 個 frame → (4, 84, 84)
+            return env
+
+        # 4 × 非同步向量環境
+        self.env = AsyncVectorEnv([partial(make_env, env_name) for _ in range(NUM_ENVS)])
+        # 測試用單環境（同步即可）
+        self.test_env = make_env(env_name)
+        # Support AsyncVectorEnv where action_space is MultiDiscrete([n, n, …])
+        self.num_actions = (
+            self.env.single_action_space.n
+            if hasattr(self.env, "single_action_space")
+            else int(getattr(self.env.action_space, "n", self.env.action_space.nvec[0]))
+        )
+        # self.preprocessor = AtariPreprocessor()
 
         if torch.backends.mps.is_available():
             self.device = torch.device("mps")
@@ -140,11 +214,24 @@ class DQNAgent:
 
         # Build networks with correct input shape after preprocessing one observation
         dummy_obs, _ = self.env.reset()
-        dummy_state = self.preprocessor.reset(dummy_obs)
+        dummy_state = dummy_obs[0]          # one stacked (4,84,84) sample
         input_shape = dummy_state.shape  # (4, 84, 84)
         self.q_net = DQN(self.num_actions, input_shape).to(self.device)
         self.q_net.apply(init_weights)
+        # ── Optional: Torch 2.x dynamic compiler (CUDA only; MPS still unstable) ──
+        if self.device.type == "cuda" and hasattr(torch, "compile"):
+            try:
+                self.q_net = torch.compile(self.q_net)
+            except Exception:
+                pass
+        # ---- target network ----
         self.target_net = DQN(self.num_actions, input_shape).to(self.device)
+        if self.device.type == "cuda" and hasattr(torch, "compile"):  # compile BEFORE loading weights
+            try:
+                self.target_net = torch.compile(self.target_net)
+            except Exception:
+                pass
+        # q_net is already compiled; state_dict keys now include "_orig_mod."
         self.target_net.load_state_dict(self.q_net.state_dict())
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=args.lr)
 
@@ -175,28 +262,33 @@ class DQNAgent:
 
     def run(self, episodes=1000):
         for _ in range(episodes):
-            ep = self.ep_count 
-            obs, _ = self.env.reset()
+            ep = self.ep_count
 
-            state = self.preprocessor.reset(obs)
-            done = False
-            total_reward = 0
+            # ❶ reset 會回傳 shape = (NUM_ENVS, 4, 84, 84) 的 ndarray
+            states, _ = self.env.reset(seed=None)
+            dones = np.zeros(self.env.num_envs, dtype=bool)
+            total_reward = np.zeros(self.env.num_envs, dtype=np.float32)
             step_count = 0
 
-            while not done and step_count < self.max_episode_steps:
-                action = self.select_action(state)
-                next_obs, reward, terminated, truncated, _ = self.env.step(action)
-                done = terminated or truncated
-                
-                next_state = self.preprocessor.step(next_obs)
-                self.memory.append((state, action, reward, next_state, done))
+            while not dones.all() and step_count < self.max_episode_steps:
+                # ❷ 逐一對 4 個 env 選 action（也可以改成一次張量前向，但這樣改動最小）
+                actions = [self.select_action(s) for s in states]
 
+                # ❸ vector env 一次 step 4 個 action
+                next_states, rewards, terminated, truncated, _ = self.env.step(actions)
+                dones = np.logical_or(terminated, truncated)
+
+                # ❹ 把 4 個 transition 拆開丟進 replay buffer
+                for i in range(self.env.num_envs):
+                    self.memory.append((states[i], actions[i], rewards[i], next_states[i], dones[i]))
+
+                # ❺ 同步訓練：一次 step 之後還是呼叫 train_per_step 次
                 for _ in range(self.train_per_step):
                     self.train()
 
-                state = next_state
-                total_reward += reward
-                self.env_count += 1
+                states = next_states
+                total_reward += rewards
+                self.env_count += self.env.num_envs
                 step_count += 1
 
                 if self.env_count % 1000 == 0:                 
@@ -212,10 +304,12 @@ class DQNAgent:
                     # Add additional wandb logs for debugging if needed 
                     
                     ########## END OF YOUR CODE ##########   
-            print(f"[Eval] Ep: {ep} Total Reward: {total_reward} SC: {self.env_count} UC: {self.train_count} Eps: {self.epsilon:.4f}")
+            # ❻ Pong 結束時 4 個 env 可能同時或不同時 done
+            ep_reward = total_reward.mean()   # 取平均當作這個 episode 的 reward
+            print(f"[Eval] Ep: {ep} AvgR: {ep_reward:.2f}  Step: {self.env_count}  Upd: {self.train_count}  ε={self.epsilon:.4f}")
             wandb.log({
                 "Episode": ep,
-                "Total Reward": total_reward,
+                "Total Reward": ep_reward,
                 "Env Step Count": self.env_count,
                 "Update Count": self.train_count,
                 "Epsilon": self.epsilon
@@ -293,8 +387,7 @@ class DQNAgent:
                     state[k] = v.to(self.device)
 
     def evaluate(self):
-        obs, _ = self.test_env.reset()
-        state = self.preprocessor.reset(obs)
+        state, _info = self.test_env.reset()
         done = False
         total_reward = 0
 
@@ -305,7 +398,7 @@ class DQNAgent:
             next_obs, reward, terminated, truncated, _ = self.test_env.step(action)
             done = terminated or truncated
             total_reward += reward
-            state = self.preprocessor.step(next_obs)
+            state = next_obs
 
         return total_reward
 
@@ -346,7 +439,7 @@ class DQNAgent:
 
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(self.q_net.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
         self.optimizer.step()
 
         if self.train_count % self.target_update_frequency == 0:
@@ -361,17 +454,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--save-dir", type=str, default="./results")
     parser.add_argument("--wandb-run-name", type=str, default="pong-run")
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--memory-size", type=int, default=100000)
-    parser.add_argument("--lr", type=float, default=0.0001)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--memory-size", type=int, default=200000)
+    parser.add_argument("--lr", type=float, default=0.00025)
     parser.add_argument("--discount-factor", type=float, default=0.99)
     parser.add_argument("--epsilon-start", type=float, default=1.0)
-    parser.add_argument("--epsilon-decay", type=float, default=0.999999)
+    parser.add_argument("--epsilon-decay", type=float, default=0.999997)
     parser.add_argument("--epsilon-min", type=float, default=0.05)
-    parser.add_argument("--target-update-frequency", type=int, default=1000)
-    parser.add_argument("--replay-start-size", type=int, default=50000)
-    parser.add_argument("--max-episode-steps", type=int, default=10000)
-    parser.add_argument("--train-per-step", type=int, default=1)
+    parser.add_argument("--target-update-frequency", type=int, default=20000)
+    parser.add_argument("--replay-start-size", type=int, default=30000)
+    parser.add_argument("--max-episode-steps", type=int, default=5000)
+    parser.add_argument("--train-per-step", type=int, default=4)
     parser.add_argument("--load-ckpt", type=str, default="", help="Path to checkpoint")
     parser.add_argument("--ep-count", type=int, default=0, help="Episode count for loading checkpoint")
     parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run")
